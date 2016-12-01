@@ -1,0 +1,564 @@
+# Run variancePartition analysis in DLPFC + ACC RNA-seq samples
+## Gabriel Hoffman
+### r date()`
+
+Based on https://github.com/th1vairam/Brain_Reg_Net/blob/CMC/code/Rmd/CMC_ACC_And_DLPFC_StarAligned_TMM.Rmd
+
+```{r knit2synapse, eval=FALSE}
+library(knitr)
+library(knit2synapse)
+library(synapseClient)
+
+synapseLogin()
+
+knit2synapse::knitToFolderEntity(file = "./CMC_ACC_And_DLPFC_StarAligned_TMM.Rmd",
+                                 parentId ="syn7501880",
+                                 entityName = 'ACC and DLPFC - STAR Reprocessed - with TMM')
+```
+
+```{r libs, echo=FALSE, warning=FALSE, message=FALSE, include=FALSE}
+## It is assumed your working directory is where this file
+
+## Load required libraries
+library(CovariateAnalysis) # get it from devtools::install_github('th1vairam/CovariateAnalysis@dev')
+library(data.table)
+library(tidyr)
+library(plyr)
+library(dplyr)
+library(stringr)
+
+library(ggplot2)
+library(reshape2)
+library(limma)
+library(Biobase)
+library(gplots)
+library(psych)
+library(edgeR)
+library(biomaRt)
+library(RColorBrewer)
+
+library(synapseClient)
+library(knitr)
+# library(githubr)
+
+library(foreach)
+library(doParallel)
+
+cl = makeCluster(14)
+registerDoParallel(cl)
+
+synapseLogin()
+
+## Requires ggdendro
+devtools::source_url("https://raw.githubusercontent.com/chr1swallace/random-functions/master/R/ggplot-heatmap.R")
+
+options(xtable.type="html")
+
+knitr::opts_chunk$set(
+  echo=FALSE,
+  warning=FALSE,
+  message=FALSE,
+  error = FALSE,
+  tidy = FALSE,
+  cache = TRUE,
+  dev = c("png", "pdf"), 
+  fig.width=7, fig.height=7)
+```
+
+```{r synapse.parameters, include=FALSE, cache=TRUE}
+# Synapse parameters
+parentId = 'syn7501880';
+activityName = 'Covariate adjustments';
+activityDescription = 'Covariate analysis of star aligned CMC reprocessed RNASeq data with TMM normalisation (ACC and DLPFC)';
+
+# thisFileName <- 'CMC_ACC_And_DLPFC_StarAligned_TMM.Rmd'
+
+# # Github link
+# thisRepo <- getRepo(repository = "th1vairam/Brain_Reg_Net", ref="branch", refName='CMC')
+# thisFile <- getPermlink(repository = thisRepo, repositoryPath=paste0('code/Rmd/',thisFileName))
+```
+### Data download
+#### Obtain count matrix and metadata from synapse.
+```{r download.data, cache=TRUE}
+# Download reprocessed counts (ACC)
+COUNT_ACC_ID = 'syn7217917';
+ALL_USED_IDs = COUNT_ACC_ID
+COUNT_ACC = read.table(synGet(COUNT_ACC_ID)@filePath, header=T, sep='\t', check.names = F, nrows = 56632) %>%
+  dplyr::select(-chr, -start, -end, -strand, -length)
+
+# Download reprocessed counts (DLPFC)
+COUNT_DLPFC_ID = 'syn7217916';
+ALL_USED_IDs[length(ALL_USED_IDs)+1] = COUNT_DLPFC_ID
+COUNT_DLPFC = read.table(synGet(COUNT_DLPFC_ID)@filePath, header=T, sep='\t', check.names = F, nrows = 56632) %>%
+  dplyr::select(-chr, -start, -end, -strand, -length)
+
+COUNT = join_all(list(COUNT_ACC, COUNT_DLPFC), type = 'full')
+rownames(COUNT) = COUNT$geneID
+COUNT$geneID = NULL
+COUNT = data.matrix(COUNT)
+
+# Get merged metadata
+METADATA_ID = 'syn2299154'
+ALL_USED_IDs[length(ALL_USED_IDs)+1] = METADATA_ID
+METADATA = read.csv(synGet(METADATA_ID)@filePath, fill = T, header = F)
+
+# Get ancestry vector calculated using gemtools
+ANCESTRY_ID = 'syn2511399'
+ALL_USED_IDs[length(ALL_USED_IDs)+1] = ANCESTRY_ID
+ANCESTRY = read.table(synGet(ANCESTRY_ID)@filePath, fill = T, header = T, sep = '\t') %>%
+  plyr::rename(c('DNA_report..Genotyping.Sample_ID' = 'GenotypingSampleID'))
+
+## Metadata with specific information for RNASeq processing
+metadataVarOfInterest = c("Individual ID", "Institution", "Gender", "Age of Death", "PMI (in hours)", 
+                          "Dx", "ACC_RNA_isolation: Exclude?", "ACC_RNA_isolation: Sample RNA ID",
+                          "ACC_RNA_isolation: RIN", "ACC_RNA_report: Exclude?", "ACC_RNA_report: Library Batch",
+                          "DLPFC_RNA_isolation: Exclude?", "DLPFC_RNA_isolation: Sample RNA ID",
+                          "DLPFC_RNA_isolation: RIN", "DLPFC_RNA_report: Exclude?", "DLPFC_RNA_report: Library Batch",
+                          'DNA_genotyping_report: Genotyping Sample_ID')
+
+# Filter metadata 
+ind = as.character(METADATA[1,] %>% unlist) %in% metadataVarOfInterest
+METADATA = METADATA[,ind]
+colnames(METADATA) = gsub('[^[:alnum:]]','_',as.character(METADATA[1,] %>% unlist))
+
+METADATA_ACC = METADATA %>%
+  dplyr::select(Individual_ID, Institution, Gender, Age_of_Death, PMI__in_hours_, Dx, ACC_RNA_isolation__Exclude_,
+                ACC_RNA_isolation__Sample_RNA_ID, ACC_RNA_isolation__RIN, ACC_RNA_report__Exclude_,
+                ACC_RNA_report__Library_Batch, DNA_genotyping_report__Genotyping_Sample_ID) %>%
+  dplyr::rename(PMI = PMI__in_hours_, 
+                IsolationExclude = ACC_RNA_isolation__Exclude_, 
+                SampleID = ACC_RNA_isolation__Sample_RNA_ID, 
+                RIN = ACC_RNA_isolation__RIN, 
+                ReportExclude = ACC_RNA_report__Exclude_, 
+                LibraryBatch = ACC_RNA_report__Library_Batch,
+                GenotypingSampleID = DNA_genotyping_report__Genotyping_Sample_ID) %>%
+  dplyr::filter(SampleID %in% colnames(COUNT)) %>%
+  dplyr::mutate(Tissue = 'ACC')
+
+METADATA_DLPFC = METADATA %>%
+  dplyr::select(Individual_ID, Institution, Gender, Age_of_Death, PMI__in_hours_, Dx, DLPFC_RNA_isolation__Exclude_,
+                DLPFC_RNA_isolation__Sample_RNA_ID, DLPFC_RNA_isolation__RIN, DLPFC_RNA_report__Exclude_,
+                DLPFC_RNA_report__Library_Batch, DNA_genotyping_report__Genotyping_Sample_ID) %>%
+  dplyr::rename(PMI = PMI__in_hours_, 
+                IsolationExclude = DLPFC_RNA_isolation__Exclude_, 
+                SampleID = DLPFC_RNA_isolation__Sample_RNA_ID, 
+                RIN = DLPFC_RNA_isolation__RIN, 
+                ReportExclude = DLPFC_RNA_report__Exclude_, 
+                LibraryBatch = DLPFC_RNA_report__Library_Batch,
+                GenotypingSampleID = DNA_genotyping_report__Genotyping_Sample_ID) %>%
+  dplyr::filter(SampleID %in% colnames(COUNT)) %>%
+  dplyr::mutate(Tissue = 'DLPFC')
+
+METADATA = rbindlist(list(METADATA_ACC, METADATA_DLPFC), use.names = T, fill = T) %>%
+  droplevels() %>%
+  dplyr::mutate(LibraryBatch = as.factor(LibraryBatch)) %>%
+  left_join(ANCESTRY)
+
+# Replace AFF and BP samples as other
+levels(METADATA$Dx) = c("Other", "Other", "Control", "SCZ")
+```
+
+### Data preprocessing
+```{r preprocess.data, cache=TRUE}
+# Remove samples marked as exclude and samples with no Gender, Ethnicity, PMI, and RIN
+writeLines('Following counts are missing any metadata')
+writeLines(paste(setdiff(colnames(COUNT), levels(METADATA$SampleID)), collapse = ', '))
+METADATA <- METADATA %>% filter(SampleID %in% colnames(COUNT)) 
+
+writeLines('Following samples are marked exclude')
+writeLines(paste(METADATA$SampleID[METADATA$IsolationExclude == 1 | METADATA$ReportExclude == 1], collapse = ', '))
+METADATA <- METADATA  %>% filter(IsolationExclude == 0, ReportExclude == 0) 
+
+writeLines('Following samples are missing PMI information')
+writeLines(paste(METADATA$SampleID[is.na(METADATA$PMI)], collapse = ', '))
+METADATA <- METADATA  %>% filter(!is.na(PMI)) 
+
+writeLines('Following samples are missing gender information')
+writeLines(paste(METADATA$SampleID[is.na(METADATA$Gender)], collapse = ', '))
+METADATA <- METADATA  %>% filter(!is.na(Gender)) 
+
+writeLines('Following samples are missing RIN information')
+writeLines(paste(METADATA$SampleID[is.na(METADATA$RIN)], collapse = ', '))
+METADATA <- METADATA  %>% filter(!is.na(RIN)) 
+
+writeLines('Following samples are missing EV information')
+writeLines(paste(METADATA$SampleID[is.na(METADATA$EV.1)], collapse = ', '))
+METADATA <- METADATA  %>% filter(!is.na(METADATA$EV.1)) 
+```
+
+```{r preprocess.data1, results='asis', cache=TRUE}
+# Match covariates to expression data
+indToRetain = intersect(METADATA$SampleID, colnames(COUNT))
+removedIDs = setdiff(colnames(COUNT), METADATA$SampleID)
+
+COUNT = COUNT[,indToRetain]
+
+rownames(METADATA) = METADATA$SampleID
+METADATA = METADATA[indToRetain,]
+
+METADATA %>% 
+  group_by(Dx, Tissue) %>% 
+  summarise(count = n()) %>% 
+  spread(Tissue, count) %>%
+  kable()
+
+METADATA = METADATA %>%
+  dplyr::mutate(Dx.Tissue = paste(Dx, Tissue, sep = '.'))
+```
+Following sample are removed `r paste(removedIDs, collapse = ',')`
+
+### Covariate clustering
+Determine relationship between covariates. 
+```{r covariates.clustering, cache=TRUE}
+FactorCovariates <- c("Individual_ID", "Institution", "Gender", "LibraryBatch", "Dx.Tissue")
+ContCovariates <- c("Age_of_Death", "PMI", "RIN", "EV.1", "EV.2", "EV.3", "EV.4", "EV.5")
+
+# Find inter relation between factor covariates
+COVARIATES = METADATA[,c(FactorCovariates,ContCovariates),drop=F]
+COVARIATES[,FactorCovariates] <- data.frame(lapply(COVARIATES[,FactorCovariates],function(x){x <- sapply(x,function(y){str_replace_all(as.character(y),'[^[:alnum:]]','_')})}))
+rownames(COVARIATES) <- METADATA$SampleID
+
+# Convert factor covariates to factors
+COVARIATES[,FactorCovariates] = lapply(COVARIATES[,FactorCovariates], factor)
+COVARIATES[,ContCovariates] = lapply(COVARIATES[,ContCovariates], as.character)
+COVARIATES[,ContCovariates] = lapply(COVARIATES[,ContCovariates], as.numeric)
+
+# Add in RIN^2 values
+COVARIATES$RIN2 = COVARIATES$RIN^2
+ContCovariates = c(ContCovariates, 'RIN2')
+```
+
+# Extract Dx and Tissue variables
+```{r Tissue.Dx, fig.height=7}
+COVARIATES$Dx = factor(sapply(strsplit(as.character(COVARIATES$Dx.Tissue), "_"), function(x) x[1]))
+COVARIATES$Tissue = factor(sapply(strsplit(as.character(COVARIATES$Dx.Tissue), "_"), function(x) x[2]))
+```
+# Venn diagram of DLPFC / ACC overlap
+```{r venndiagram, fig.height=8, fig.width=8, cache=TRUE}
+library(VennDiagram)
+set1 = COVARIATES$Individual_ID[COVARIATES$Tissue == levels(COVARIATES$Tissue)[1]]
+set2 = COVARIATES$Individual_ID[COVARIATES$Tissue == levels(COVARIATES$Tissue)[2]]
+setBoth = intersect(set1, set2)
+
+col = c("red", "blue")
+names(col) = levels(COVARIATES$Tissue)
+
+fig = draw.pairwise.venn(area1 = length(set1), area2 = length(set2), cross.area=length(setBoth), category = names(col), lty = rep("blank", 2), fill = col, alpha = rep(0.5, 2), cat.col=col )
+
+```
+
+### CPM Normalisation
+Preprocess counts matrix and metadata. Determine design matrix for normalisation and differential expression analysis. 
+
+Remove genes that have less than 1 cpm counts in at least 50% of samples per Dx.Tissue
+```{r cpmnormalisation}
+genesToAnalyze = dlply(METADATA, .(Dx.Tissue), .fun = function(mtd, count){
+  processed.counts = getGeneFilteredGeneExprMatrix(count[,mtd$SampleID %>% droplevels()],
+                                                   MIN_GENE_CPM=1, 
+                                                   MIN_SAMPLE_PERCENT_WITH_MIN_GENE_CPM=0.5)
+  processed.counts$filteredExprMatrix$genes
+}, COUNT)
+genesToAnalyze = unlist(genesToAnalyze) %>% unique()
+
+PROCESSED_COUNTS = getGeneFilteredGeneExprMatrix(COUNT[genesToAnalyze, ], MIN_GENE_CPM=0, MIN_SAMPLE_PERCENT_WITH_MIN_GENE_CPM=0)
+```
+Processing `r dim(PROCESSED_COUNTS$filteredExprMatrix)[1]` genes in `r dim(PROCESSED_COUNTS$filteredExprMatrix)[2]` samples
+
+### Normalisation (with NULL)
+Initial normalisation usign voom (with NULL design)
+```{r initial.voom.normalisation, fig.height=5, fig.width=5}
+# TMM normalisation
+TMM.GENE_EXPRESSION = calcNormFactors(PROCESSED_COUNTS$filteredExprMatrix, method = 'TMM')
+
+# Initial normalisation of gene expression
+VOOM.GENE_EXPRESSION = voom(TMM.GENE_EXPRESSION, design=NULL, plot=T)
+
+# Set gene counts in specific samples that are deviating 3 sd from other samples to NA
+log.mat = apply(VOOM.GENE_EXPRESSION$E, 1, function(x){
+  mn = mean(x, na.rm = T)
+  std.dev = sd(x, na.rm = T)
+  return((x < (mn-3*std.dev)) | (x > (mn+3*std.dev)))
+}) %>% t
+PROCESSED_COUNTS$filteredExprMatrix[log.mat] = NA
+
+# TMM normalisation
+TMM.GENE_EXPRESSION = calcNormFactors(PROCESSED_COUNTS$filteredExprMatrix, method = 'TMM')
+
+# Initial normalisation of gene expression
+VOOM.GENE_EXPRESSION = voom(TMM.GENE_EXPRESSION, design=NULL, plot=T)
+```
+
+# Processing before variancePartition
+```{r variancePartition.version}
+writeLines(paste0("variancePartition v", packageVersion("variancePartition")))
+```
+
+```{r load.variancePartition, echo=TRUE}
+library(variancePartition)
+library(ggplot2)
+library(limma)
+library(readr)
+library(gridExtra)
+```
+
+```{r load.geneMap}
+# get gene annotations
+geneMaps = read_csv(synGet("syn7113731")@filePath)
+geneMaps = geneMaps[geneMaps$Geneid %in% rownames(VOOM.GENE_EXPRESSION), ]
+```
+
+
+# Corrleation between covariates using CCA
+```{r covariates.cca, fig.height=7, fig.width=7, echo=TRUE}
+# Compute CCA correlation values between all pairs of variables
+form = ~ Individual_ID + Institution + Gender + LibraryBatch + Age_of_Death + PMI + 
+  RIN + RIN2 + EV.1 + EV.2 + EV.3 + EV.4 + EV.5 + Dx
+
+C = canCorPairs( form, COVARIATES)
+
+plotCorrMatrix(C, margin=c(11, 11), main="Canonical Correlation Analysis")
+```
+
+# variancePartition Analysis
+```{r variancePartition, fig.height=8, fig.width=8, echo=TRUE}
+form = ~ (1|Individual_ID) + (1|Institution) + (1|Gender) + (1|LibraryBatch) + (1|Dx) + 
+  (1|Tissue) + Age_of_Death + PMI + RIN + RIN2 + 
+  EV.1 + EV.2 + EV.3 + EV.4 + EV.5 
+
+# Joint Analysis
+varPart = fitExtractVarPartModel( VOOM.GENE_EXPRESSION, form, COVARIATES )
+
+plotVarPart( sortCols( varPart ), label.angle=40 )
+```
+
+
+# variancePartition: sum multiple RIN and EV columns
+```{r variancePartition.sum, fig.width=8, fig.height=8}
+# combined related columns
+# RIN, RIN2
+# EV.1, EV.2, EV.3, EV.4, EV.5
+varPartSum = varPart
+varPartSum[['RIN+RIN2']] = with(varPart, RIN + RIN2)
+varPartSum$EV = with(varPart, EV.1 + EV.2 + EV.3 + EV.4 + EV.5)
+varPartSum[['RIN']] = NULL
+varPartSum[['RIN2']] = NULL
+varPartSum[['EV.1']] = NULL
+varPartSum[['EV.2']] = NULL
+varPartSum[['EV.3']] = NULL
+varPartSum[['EV.4']] = NULL
+varPartSum[['EV.5']] = NULL
+
+vp = sortCols(varPartSum)
+
+fig = plotVarPart( vp, label.angle=40 )
+fig
+```
+
+# Compute residuals, removing variance due to technical variables
+```{r residuals.create residMatrix, echo=TRUE}
+form = ~ (1|Institution) + (1|LibraryBatch) + PMI + RIN + EV.1 + EV.2 + EV.3 + EV.4 + EV.5 + RIN2
+
+# Compute residuals + intercept
+# apply this function to each model fit
+fitList = fitVarPartModel( VOOM.GENE_EXPRESSION, form, COVARIATES, fxn=function(fit){
+  residuals(fit) + fit@beta[1]
+  } )
+
+residMatrix = do.call(rbind, fitList)
+```
+
+# run variancePartition on residuals
+```{r variancePartition.on.residual, echo=TRUE}
+form = ~ (1|Individual_ID) + (1|Dx) + (1|Tissue)+ (1|Gender) + Age_of_Death
+
+#Joint Analysis
+varPartResiduals = fitExtractVarPartModel( residMatrix, form, COVARIATES )
+
+plotVarPart( sortCols( varPartResiduals ), label.angle=40 )
+```
+
+
+# PCA of Residuals
+```{r residuals.pca}
+
+# Find principal components of expression to plot
+PC <- prcomp(residMatrix, scale.=T, center = T)
+percentVar = PC$sdev^2 / sum(PC$sdev^2) * 100
+# Plot first 2 PCs
+plotdata <- data.frame(SampleID=rownames(PC$rotation), 
+                       PC1=PC$rotation[,1], 
+                       PC2=PC$rotation[,2])
+
+plotdata <- left_join(plotdata, rownameToFirstColumn(COVARIATES, 'SampleID'))
+
+p <- ggplot(plotdata, aes(x=PC1, y=PC2))
+p <- p + geom_point(aes(color=Institution, shape=Dx.Tissue, size=Age_of_Death))
+p <- p + theme_bw() + theme(legend.position="top") 
+p <- p + xlab(paste0("PC1 (", format(percentVar[1], digits=3), "%)"))
+p <- p + ylab(paste0("PC2 (", format(percentVar[2], digits=3), "%)"))
+# p <- p + geom_text(aes(label= SampleID), size=4, hjust=0)
+p
+```
+
+
+# Effective sample size
+```{r ess, echo=TRUE}
+form = ~ (1|Individual_ID) + (1|Institution) + (1|Gender) + (1|LibraryBatch) + (1|Dx) + 
+  (1|Tissue) + Age_of_Death + PMI + RIN + RIN2 + 
+  EV.1 + EV.2 + EV.3 + EV.4 + EV.5 
+
+idx = seq(1, nrow(VOOM.GENE_EXPRESSION), by=40)
+res = fitVarPartModel( VOOM.GENE_EXPRESSION[idx,], form, COVARIATES, fxn=ESS )
+n_eff = sapply(res, function(x) x['Individual_ID'])
+
+n_total = ncol(VOOM.GENE_EXPRESSION)
+n_indivs = nlevels(COVARIATES$Individual_ID)
+plot(vp$Individual_ID[idx], n_eff, xlab="% variance across individuals", 
+  ylab="Effective sample size", ylim=c(0, n_total), main="Effective sample size")
+abline( h = n_total, col="blue", lty=2)
+abline( h = n_indivs, col="red",  lty=2 )
+text(0.6, n_total*.97, "Total samples", col="blue")
+text(0.6, n_indivs*.95, "Unique individuals", col="red")
+```
+
+# Percentages for top gene for each variable
+```{r variancePartition.percentBar, fig.height=12, fig.width=12}
+idx = apply(as.matrix(vp), 2, which.max)
+
+vpSub = vp[idx,]
+
+idx2 = match(rownames(vpSub), geneMaps$Geneid)
+hgncGene = geneMaps$geneName[idx2[!is.na(idx2)]]
+
+rownames(vpSub) = paste0(rownames(vpSub), " -  ", hgncGene)
+
+plotPercentBars( vpSub ) + theme(axis.text.y = element_text( size=10))
+```
+
+# Plot examples
+```{r plot.examples}
+idx = apply(as.matrix(varPart), 2, which.max)
+
+for( i in 1:length(idx)){
+
+  key = names(idx)[i]
+
+  if( !(key %in% colnames(COVARIATES)) ) next
+
+  vpSub = vp[idx[i],]
+  rownames(vpSub) = ""
+  figPercent = plotPercentBars( vpSub ) 
+  figPercent = figPercent + theme(legend.position="none", plot.margin = unit(c(0,.3,0,.8), "cm"))
+  figPercent = figPercent + theme(axis.text.y=element_text(color="transparent"))
+
+  if( ! is.numeric(COVARIATES[,key]) ){
+    
+    ensGene = rownames(VOOM.GENE_EXPRESSION)[idx[i]]
+    hgncGene = geneMaps$geneName[geneMaps$Geneid == ensGene]
+    main = ifelse(length(grep("ENSG", hgncGene)) == 0, paste0(ensGene, ' - ',hgncGene), ensGene)
+
+    GE = data.frame( Expression = VOOM.GENE_EXPRESSION$E[idx[i],], variable = COVARIATES[,key])
+    colorBy = ifelse( nlevels(COVARIATES[,key]) < 20, 'variable', NA )
+    figStrat = plotStratify( Expression ~ variable, GE, colorBy=colorBy, main=main) + xlab(key) 
+  }
+
+  if( is.numeric(COVARIATES[,key]) ){
+
+    ensGene = rownames(VOOM.GENE_EXPRESSION)[idx[i]]
+    hgncGene = geneMaps$geneName[geneMaps$Geneid == ensGene]
+    main = ifelse(length(grep("ENSG", hgncGene)) == 0, paste0(ensGene, ' - ',hgncGene), ensGene)
+
+    GE = data.frame( Expression = VOOM.GENE_EXPRESSION$E[idx[i],], variable = COVARIATES[,key])
+
+    figStrat = ggplot(GE, aes(variable, Expression)) + geom_point() + theme_bw() + xlab(key) +
+      ggtitle(main) + theme(plot.title = element_text(hjust = 0.5)) +
+      geom_smooth(method = "lm", se = FALSE)
+  }
+
+  grid.arrange( figStrat, figPercent, ncol=1, heights=c(1,.14))
+}
+```
+
+# GC content effect
+```{r gc.effect}
+
+# Percent GC
+idx = match( geneMaps$Geneid, rownames(vp))
+
+exprMagnitude = rowMeans(VOOM.GENE_EXPRESSION$E)
+df = data.frame(as.matrix(vp[idx,]), "gene.length"=log10(geneMaps$Length), gc.content=geneMaps$percentage_gc_content, exprMagnitude)
+
+i = 1:ncol(vp)
+corResults = cor(df[,i], df[,-i], method='spearman', use="pairwise.complete.obs")
+
+res = melt(corResults)
+
+res$X2 = factor(res$X2, c('gene.length', 'exprMagnitude','gc.content' ))
+
+fig = ggplot(res, aes(X1, value)) + geom_bar(aes(fill=X2), stat="identity", position = "dodge") + 
+  ylab("correlation") + theme_bw() + xlab("")
+fig = fig + theme(axis.text.x = element_text(size = 13, angle = 60, hjust = 1, vjust = 1))  + geom_hline(yintercept=0)
+fig
+
+# Specific examples
+par(mfrow=c(2,2), mar=c(4, 4,2, 2) + 0.1)
+plot(vp$Institution[idx], geneMaps$percentage_gc_content, pch=20, cex=.1, xlab="Variance explained by Institution (%)", ylab="GC content (%)")
+abline(lm( geneMaps$percentage_gc_content ~ vp$Institution[idx]), col="red")
+corResult = cor.test(vp$Institution[idx], geneMaps$percentage_gc_content, 
+  use="pairwise.complete.obs", method='spearman', exact=FALSE)
+rsq = format(corResult$estimate, digits=3)
+pVvalue = format(corResult$p.value, digits=3, scientific=TRUE)
+text(.35, 80, bquote(atop(R[spearman] == .(rsq), p < .(pVvalue))))
+
+plot(vp$LibraryBatch[idx], geneMaps$percentage_gc_content, pch=20, cex=.1, xlab="Variance explained by LibraryBatch (%)", ylab="GC content (%)")
+abline(lm( geneMaps$percentage_gc_content ~ vp$LibraryBatch[idx]), col="red")
+corResult = cor.test(vp$LibraryBatch[idx], geneMaps$percentage_gc_content, 
+  use="pairwise.complete.obs", method='spearman', exact=FALSE)
+rsq = format(corResult$estimate, digits=3)
+pVvalue = format(corResult$p.value, digits=3, scientific=TRUE)
+text(.62, 80, bquote(atop(R[spearman] == .(rsq), p < .(pVvalue))))
+
+plot(vp$Institution[idx], log10(geneMaps$Length), pch=20, cex=.1, xlab="Variance explained by Institution (%)", ylab="log10 gene length")
+abline(lm( log10(geneMaps$Length) ~ vp$Institution[idx]), col="red")
+corResult = cor.test(vp$Institution[idx], log10(geneMaps$Length), 
+  use="pairwise.complete.obs", method='spearman', exact=FALSE)
+rsq = format(corResult$estimate, digits=3)
+pVvalue = format(corResult$p.value, digits=3, scientific=TRUE)
+text(.35, 4.5, bquote(atop(R[spearman] == .(rsq), p < .(pVvalue))))
+
+plot(vp$LibraryBatch[idx], log10(geneMaps$Length), pch=20, cex=.1, xlab="Variance explained by LibraryBatch (%)", ylab="log10 gene length")
+abline(lm( log10(geneMaps$Length) ~ vp$LibraryBatch[idx]), col="red")
+corResult = cor.test(vp$LibraryBatch[idx], log10(geneMaps$Length), 
+  use="pairwise.complete.obs", method='spearman', exact=FALSE)
+rsq = format(corResult$estimate, digits=3)
+pVvalue = format(corResult$p.value, digits=3, scientific=TRUE)
+text(.62, 4.5, bquote(atop(R[spearman] == .(rsq), p < .(pVvalue))))
+
+```
+
+
+
+# variancePartition relation to eQTL
+```{r variancePartition.eQTL, fig.height=8, fig.width=15}
+
+eGenes = as.matrix(read.table("~/commonmind/hoffman/bayesian_network/cisEQTL_fdr_0.01.tsv", stringsAsFactors=FALSE))
+
+par(mfrow=c(1,2))
+isEQTL = rep(FALSE, nrow(vp))
+names(isEQTL) = rownames(vp)
+isEQTL[names(isEQTL) %in% eGenes] = TRUE
+table(isEQTL)
+boxplot( vp$Individual_ID*100 ~ c("not eQTL", "eQTL")[isEQTL+1], ylab="Variance explained by Individual_ID (%)", col=c("red", "lightblue"), main="Expression variation across individuals due to genetics")
+est = wilcox.test(  vp$Individual_ID[isEQTL], vp$Individual_ID[!isEQTL], alternative="greater")
+text(1.5, 80, paste("One sided Wilcoxon\n rank sum\np<", format(est$p.value, digits=2)))
+
+
+isEQTL = rep(FALSE, nrow(varPartResiduals))
+names(isEQTL) = rownames(varPartResiduals)
+isEQTL[names(isEQTL) %in% eGenes] = TRUE
+# table(isEQTL)
+boxplot( varPartResiduals$Individual_ID*100 ~ c("not eQTL", "eQTL")[isEQTL+1], ylab="Variance explained by Individual_ID (%)", col=c("red", "lightblue"), main="Expression variation across individuals due to genetics\n(from residuals)")
+est = wilcox.test(  varPartResiduals$Individual_ID[isEQTL], varPartResiduals$Individual_ID[!isEQTL], alternative="greater")
+text(1.5, 80, paste("One sided Wilcoxon\n rank sum\np<", format(est$p.value, digits=2)))
+```
+
